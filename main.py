@@ -17,9 +17,6 @@ from torch.utils.data import DataLoader
 from utils import clean_text, build_product_text, truncate_words, add_basic_features
 from utils import compute_bm25_for_df, compute_ndcg_by_query
 
-from nbclient import NotebookClient
-import nbformat
-
 def create_submission(test: pd.DataFrame):
     """
     Cоздание файла submission.csv в папку results
@@ -298,3 +295,4 @@ def main():
 if __name__ == "__main__":
     main()
     print("Для просмотра анализа данных, откройте файл `eda.ipynb`")
+
