@@ -142,9 +142,6 @@ def main():
     print("Train shape:", train.shape)
     print("Test shape:", test.shape)
 
-    # Создание сабмита
-    create_submission(test)
-
     # Подготовка данных перед обучением
     train, test = preprocess_data(train, test)
 
@@ -291,8 +288,11 @@ def main():
 
     # Формируем предсказание
     test["prediction"] = final_scores
+    # Создаем сабмит
+    create_submission(test)
 
 if __name__ == "__main__":
     main()
     print("Для просмотра анализа данных, откройте файл `eda.ipynb`")
+
 
