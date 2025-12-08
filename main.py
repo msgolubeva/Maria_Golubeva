@@ -182,7 +182,7 @@ def main():
         learning_rate=0.05,
         depth=7,
         random_seed=RANDOM_STATE,
-        task_type="GPU",
+        task_type="CPU",
         verbose=100,
     )
 
@@ -257,7 +257,7 @@ def main():
         learning_rate=ranker.learning_rate_,
         depth=ranker.get_param("depth"),
         random_seed=RANDOM_STATE,
-        task_type="GPU",
+        task_type="CPU",
         verbose=100,
     )
     ranker_full.fit(pool_full)
@@ -294,5 +294,6 @@ def main():
 if __name__ == "__main__":
     main()
     print("Для просмотра анализа данных, откройте файл `eda.ipynb`")
+
 
 
