@@ -147,7 +147,7 @@ def main():
 
     train, test = process_features_for_models(train, test)
 
-    # 7. Подготовка для обучения CatBoostRanker
+    # Подготовка для обучения CatBoostRanker
     numeric_cols = [
         "len_query", "len_title", "len_desc", "len_bullet",
         "has_desc", "has_bullet", "has_brand", "has_color",
@@ -162,7 +162,7 @@ def main():
 
     print("Feature matrix shapes:", X_train.shape, X_test.shape)
 
-    # 8. Валидация и обучение CatBoostRanker (YetiRank)
+    # Валидация и обучение CatBoostRanker (YetiRank)
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
     train_idx, val_idx = next(gss.split(X_train, y, groups=groups))
 
@@ -294,6 +294,7 @@ def main():
 if __name__ == "__main__":
     main()
     print("Для просмотра анализа данных, откройте файл `eda.ipynb`")
+
 
 
 
