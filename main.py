@@ -1,300 +1,263 @@
-"""
-Основной файл с решением соревнования
-"""
-import os
-os.environ["WANDB_DISABLED"] = "true"  # отключаем wandb, чтобы не просил API ключ
+import os, random
 import numpy as np
 import pandas as pd
+from collections import defaultdict, deque
+from catboost import CatBoostRegressor, Pool
 
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.feature_extraction.text import TfidfVectorizer
+SEED = 322
 
-from catboost import CatBoostRanker, Pool
+def set_seed(seed=SEED):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
-from sentence_transformers import CrossEncoder, InputExample
-from torch.utils.data import DataLoader
+set_seed(SEED)
 
-from utils import clean_text, build_product_text, truncate_words, add_basic_features
-from utils import compute_bm25_for_df, compute_ndcg_by_query
+# Load
+train = pd.read_csv("data/train.csv")
+test  = pd.read_csv("data/test.csv")
 
-def create_submission(test: pd.DataFrame):
+train["dt"] = pd.to_datetime(train["dt"])
+test["dt"]  = pd.to_datetime(test["dt"])
+
+assert "row_id" in test.columns
+
+# Base features
+CAT_COLS = [
+    "product_id", "management_group_id",
+    "first_category_id", "second_category_id", "third_category_id",
+    "dow", "month"
+]
+NUM_COLS = [
+    "n_stores", "precpt", "avg_temperature", "avg_humidity", "avg_wind_level",
+    "day_of_month", "week_of_year", "holiday_flag", "activity_flag"
+]
+
+# AR lag features
+LAG_COLS = [
+    "p05_lag1", "p95_lag1",
+    "p05_roll7_mean", "p95_roll7_mean"
+]
+
+FEATURES = CAT_COLS + NUM_COLS + LAG_COLS
+
+def build_history_from_df(df_known: pd.DataFrame):
     """
-    Cоздание файла submission.csv в папку results
+    df_known must have: dt, product_id, price_p05, price_p95
+    Returns dicts + deques for roll7.
     """
+    last_p05 = {}
+    last_p95 = {}
+    q05 = defaultdict(lambda: deque(maxlen=7))
+    q95 = defaultdict(lambda: deque(maxlen=7))
 
-    submission = test[["id", "prediction"]].copy()
-    submission.to_csv("results/submission.csv", index=False)
-    print("Saved submission to: results/submission.csv")
-
-def preprocess_data(train: pd.DataFrame, test: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
-    # очищаем все текстовые поля
-    train["query_clean"] = train["query"].apply(clean_text)
-    test["query_clean"] = test["query"].apply(clean_text)
-
-    for col in ["product_title", "product_description",
-                "product_bullet_point", "product_brand", "product_color"]:
-        train[col + "_clean"] = train[col].apply(clean_text)
-        test[col + "_clean"] = test[col].apply(clean_text)
-
-    train["product_text"] = build_product_text(train)
-    test["product_text"] = build_product_text(test)
-
-    # короткая версия текста для CrossEncoder
-    train["product_text_ce"] = train["product_text"].apply(lambda s: truncate_words(s, 128))
-    test["product_text_ce"] = test["product_text"].apply(lambda s: truncate_words(s, 128))
-
-    train = add_basic_features(train)
-    test = add_basic_features(test)
-
-    # фильтруем шум: почти пустой товар
-    noise_mask = (
-            (train["len_title"] < 3) &
-            (train["len_desc"] == 0) &
-            (train["len_bullet"] == 0)
-    )
-    print("Noisy rows to drop:", noise_mask.sum())
-
-    train = train.loc[~noise_mask].reset_index(drop=True)
-
-    return train, test
-
-def process_features_for_models(train: pd.DataFrame, test: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
-    # векторизация и токенизация признаков
-    print("Computing BM25 for train...")
-    train["bm25"] = compute_bm25_for_df(train)
-    print("Computing BM25 for test...")
-    test["bm25"] = compute_bm25_for_df(test)
-
-    print("Building joint TF-IDF for cosine similarity...")
-    joint_corpus = pd.concat([
-        train["query_clean"], train["product_text"],
-        test["query_clean"], test["product_text"]
-    ], axis=0).astype(str)
-
-    tfidf_joint = TfidfVectorizer(
-        max_features=80000,
-        ngram_range=(1, 2),
-        min_df=3
-    )
-    tfidf_joint.fit(joint_corpus)
-
-    Xq_train = tfidf_joint.transform(train["query_clean"])
-    Xd_train = tfidf_joint.transform(train["product_text"])
-
-    Xq_test = tfidf_joint.transform(test["query_clean"])
-    Xd_test = tfidf_joint.transform(test["product_text"])
-
-    cos_train = np.asarray((Xq_train.multiply(Xd_train)).sum(axis=1)).ravel().astype(np.float32)
-    cos_test = np.asarray((Xq_test.multiply(Xd_test)).sum(axis=1)).ravel().astype(np.float32)
-
-    train["cosine_joint"] = cos_train
-    test["cosine_joint"] = cos_test
-
-    del Xq_train, Xd_train, Xq_test, Xd_test  # освобождаем память
-
-    # Match-фичи для усиления обучающей способности модели
-    print("Building match features...")
-
-    train["query_tokens"] = train["query_clean"].str.split()
-    train["title_tokens"] = train["product_title_clean"].str.split()
-    train["product_tokens"] = train["product_text"].str.split()
-
-    test["query_tokens"] = test["query_clean"].str.split()
-    test["title_tokens"] = test["product_title_clean"].str.split()
-    test["product_tokens"] = test["product_text"].str.split()
-
-    def count_overlap(list1, list2):
-        return len(set(list1) & set(list2))
-
-    train["match_title"] = [
-        count_overlap(q, t) for q, t in zip(train["query_tokens"], train["title_tokens"])
-    ]
-    train["match_product"] = [
-        count_overlap(q, p) for q, p in zip(train["query_tokens"], train["product_tokens"])
-    ]
-
-    test["match_title"] = [
-        count_overlap(q, t) for q, t in zip(test["query_tokens"], test["title_tokens"])
-    ]
-    test["match_product"] = [
-        count_overlap(q, p) for q, p in zip(test["query_tokens"], test["product_tokens"])
-    ]
-
-    # точное вхождение бренда в запрос
-    train["exact_brand_in_query"] = (
-            (train["product_brand_clean"] != "") &
-            train.apply(lambda row: row["product_brand_clean"] in row["query_clean"], axis=1)
-    ).astype(int)
-
-    test["exact_brand_in_query"] = (
-            (test["product_brand_clean"] != "") &
-            test.apply(lambda row: row["product_brand_clean"] in row["query_clean"], axis=1)
-    ).astype(int)
-
-    return train, test
-
-def main():
-
-    # Загрузка данных
-    RANDOM_STATE = 993
-    train = pd.read_csv("data/train.csv", engine="python")
-    test = pd.read_csv("data/test.csv", engine="python")
-    print("Train shape:", train.shape)
-    print("Test shape:", test.shape)
-
-    # Подготовка данных перед обучением
-    train, test = preprocess_data(train, test)
-
-    train, test = process_features_for_models(train, test)
-
-    # Подготовка для обучения CatBoostRanker
-    numeric_cols = [
-        "len_query", "len_title", "len_desc", "len_bullet",
-        "has_desc", "has_bullet", "has_brand", "has_color",
-        "bm25", "cosine_joint",
-        "match_title", "match_product", "exact_brand_in_query"
-    ]
-    X_train = train[numeric_cols].astype("float32").values
-    X_test = test[numeric_cols].astype("float32").values
-    y = train["relevance"].values.astype("float32")
-    groups = train["query_id"].values
-    groups_test = test["query_id"].values
-
-    print("Feature matrix shapes:", X_train.shape, X_test.shape)
-
-    # Валидация и обучение CatBoostRanker (YetiRank)
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
-    train_idx, val_idx = next(gss.split(X_train, y, groups=groups))
-
-    X_tr, X_val = X_train[train_idx], X_train[val_idx]
-    y_tr, y_val = y[train_idx], y[val_idx]
-    qid_tr, qid_val = groups[train_idx], groups[val_idx]
-
-    train_part = train.iloc[train_idx].reset_index(drop=True)
-    val_part = train.iloc[val_idx].reset_index(drop=True)
-    pool_tr = Pool(X_tr, label=y_tr, group_id=qid_tr)
-    pool_val = Pool(X_val, label=y_val, group_id=qid_val)
-
-    ranker = CatBoostRanker(
-        loss_function="YetiRank",
-        eval_metric="NDCG:top=10",
-        iterations=1000,
-        learning_rate=0.05,
-        depth=7,
-        random_seed=RANDOM_STATE,
-        task_type="CPU",
-        verbose=100,
-    )
-
-    print("Training CatBoostRanker...")
-    ranker.fit(pool_tr, eval_set=pool_val, use_best_model=True)
-    val_pred_cb = ranker.predict(pool_val)
-    ndcg_cb = compute_ndcg_by_query(val_part, val_pred_cb, k=10)
-    print(f"CatBoostRanker validation nDCG@10: {ndcg_cb:.5f}")
-
-    # Обучение CrossEncoder (BERT)
-    MAX_CE_TRAIN_SAMPLES = 150_000
-
-    ce_train_df = train.copy()
-    if len(ce_train_df) > MAX_CE_TRAIN_SAMPLES:
-        ce_train_df = ce_train_df.sample(MAX_CE_TRAIN_SAMPLES, random_state=RANDOM_STATE)
-
-    ce_train_samples = [
-        InputExample(
-            texts=[row.query_clean, row.product_text_ce],
-            label=float(row.relevance) / 3.0
-        )
-        for row in ce_train_df.itertuples()
-    ]
-
-    ce_train_loader = DataLoader(ce_train_samples, batch_size=16, shuffle=True)
-    ce_model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    ce_model = CrossEncoder(
-        ce_model_name,
-        num_labels=1,
-        max_length=512
-    )
-
-    print("Training CrossEncoder...")
-    ce_model.fit(
-        train_dataloader=ce_train_loader,
-        epochs=1,
-        warmup_steps=int(0.1 * len(ce_train_loader)),
-        output_path=None,
-    )
-
-    # предсказания CrossEncoder на валидации
-    val_pairs = [
-        [q, p] for q, p in zip(val_part["query_clean"], val_part["product_text_ce"])
-    ]
-    ce_val_scores = ce_model.predict(val_pairs).reshape(-1)
-
-    ndcg_ce = compute_ndcg_by_query(val_part, ce_val_scores, k=10)
-    print(f"CrossEncoder validation nDCG@10: {ndcg_ce:.5f}")
-
-    # подбор лучшего alpha для ансамбля
-    alphas = np.linspace(0.0, 1.0, 21)
-    best_alpha = None
-    best_ndcg = -1.0
-    for a in alphas:
-        ens_scores = a * val_pred_cb + (1.0 - a) * ce_val_scores
-        nd = compute_ndcg_by_query(val_part, ens_scores, k=10)
-        print(f"alpha={a:.2f} -> nDCG@10={nd:.5f}")
-        if nd > best_ndcg:
-            best_ndcg = nd
-            best_alpha = a
-    print(f"Best alpha: {best_alpha:.3f} with nDCG@10={best_ndcg:.5f}")
-
-    # 10. Обучаем CatBoost на всём train
-    pool_full = Pool(X_train, label=y, group_id=groups)
-    pool_test = Pool(X_test, group_id=groups_test)
-
-    print("Training CatBoost on full train...")
-    ranker_full = CatBoostRanker(
-        loss_function="YetiRank",
-        eval_metric="NDCG:top=10",
-        iterations=ranker.tree_count_,
-        learning_rate=ranker.learning_rate_,
-        depth=ranker.get_param("depth"),
-        random_seed=RANDOM_STATE,
-        task_type="CPU",
-        verbose=100,
-    )
-    ranker_full.fit(pool_full)
-
-    cb_test_scores = ranker_full.predict(pool_test)
-
-    # Производим re-ranking top-K на тесте CrossEncoder'ом
-    print("Re-ranking test with CrossEncoder...")
-    test["cb_score"] = cb_test_scores
-    final_scores = cb_test_scores.copy()
-
-    TOP_K = 50
-    for qid, group in test.groupby("query_id"):
-        idx = group.index.values
-        scores = group["cb_score"].values
-        order = np.argsort(-scores)
-        top_local = order[:TOP_K]
-        top_idx = idx[top_local]
-
-        pairs = [
-            [test.loc[i, "query_clean"], test.loc[i, "product_text_ce"]]
-            for i in top_idx
-        ]
-        ce_scores = ce_model.predict(pairs).reshape(-1)
-
-        mixed_model = best_alpha * final_scores[top_idx] + (1.0 - best_alpha) * ce_scores
-        final_scores[top_idx] = mixed_model
-
-    # Формируем предсказание
-    test["prediction"] = final_scores
-    # Создаем сабмит
-    create_submission(test)
-
-if __name__ == "__main__":
-    main()
-    print("Для просмотра анализа данных, откройте файл `eda.ipynb`")
+    tmp = df_known.sort_values(["product_id", "dt"])
+    for pid, g in tmp.groupby("product_id", sort=False):
+        v05 = g["price_p05"].values
+        v95 = g["price_p95"].values
+        if len(v05):
+            last_p05[pid] = float(v05[-1])
+            last_p95[pid] = float(v95[-1])
+            for x in v05[-7:]:
+                q05[pid].append(float(x))
+            for x in v95[-7:]:
+                q95[pid].append(float(x))
+    return last_p05, last_p95, q05, q95
 
 
+def add_ar_lags(batch: pd.DataFrame, last_p05, last_p95, q05, q95) -> pd.DataFrame:
+    """
+    Adds AR lag features using current history state.
+    batch is for one date, but can contain many products.
+    """
+    b = batch.copy()
+    pid_arr = b["product_id"].values
+
+    p05_l1 = np.empty(len(b), dtype=float)
+    p95_l1 = np.empty(len(b), dtype=float)
+    p05_r7 = np.empty(len(b), dtype=float)
+    p95_r7 = np.empty(len(b), dtype=float)
+
+    for i, pid in enumerate(pid_arr):
+        lp05 = last_p05.get(pid, np.nan)
+        lp95 = last_p95.get(pid, np.nan)
+        p05_l1[i] = lp05
+        p95_l1[i] = lp95
+
+        dq05 = q05[pid]
+        dq95 = q95[pid]
+        p05_r7[i] = float(np.mean(dq05)) if len(dq05) else np.nan
+        p95_r7[i] = float(np.mean(dq95)) if len(dq95) else np.nan
+
+    b["p05_lag1"] = p05_l1
+    b["p95_lag1"] = p95_l1
+    b["p05_roll7_mean"] = p05_r7
+    b["p95_roll7_mean"] = p95_r7
+    return b
 
 
+def update_history_with_preds(batch: pd.DataFrame, p05_pred, p95_pred, last_p05, last_p95, q05, q95):
+    for pid, v05, v95 in zip(batch["product_id"].values, p05_pred, p95_pred):
+        v05 = float(v05); v95 = float(v95)
+        last_p05[pid] = v05
+        last_p95[pid] = v95
+        q05[pid].append(v05)
+        q95[pid].append(v95)
+
+train_sorted = train.sort_values(["product_id", "dt"]).copy()
+
+train_sorted["p05_lag1"] = train_sorted.groupby("product_id")["price_p05"].shift(1)
+train_sorted["p95_lag1"] = train_sorted.groupby("product_id")["price_p95"].shift(1)
+
+train_sorted["p05_roll7_mean"] = (
+    train_sorted.groupby("product_id")["price_p05"]
+    .shift(1).rolling(7, min_periods=1).mean()
+    .reset_index(level=0, drop=True)
+)
+train_sorted["p95_roll7_mean"] = (
+    train_sorted.groupby("product_id")["price_p95"]
+    .shift(1).rolling(7, min_periods=1).mean()
+    .reset_index(level=0, drop=True)
+)
+
+X_tr = train_sorted[FEATURES]
+
+y_tr_p05 = train_sorted["price_p05"]
+y_tr_p95 = train_sorted["price_p95"]
+
+# for RMSE head: mid + logw
+EPS_W = 1e-6
+y_tr_mid = (y_tr_p05.values + y_tr_p95.values) / 2.0
+y_tr_w   = np.maximum(y_tr_p95.values - y_tr_p05.values, EPS_W)
+y_tr_logw = np.log(y_tr_w)
+
+# CatBoost params from Optuna
+BEST = {
+    "depth": 8,
+    "learning_rate": 0.03651139083379959,
+    "l2_leaf_reg": 3.279703912387428,
+    "subsample": 0.8333382250020284,
+    "iterations": 1500,
+    "od_wait": 160
+}
+
+COMMON = dict(
+    iterations=int(BEST["iterations"]),
+    learning_rate=float(BEST["learning_rate"]),
+    depth=int(BEST["depth"]),
+    l2_leaf_reg=float(BEST["l2_leaf_reg"]),
+    random_seed=SEED,
+    task_type="GPU",
+    od_type="Iter",
+    od_wait=int(BEST["od_wait"]),
+    verbose=300,
+)
+
+pool_tr05 = Pool(X_tr, y_tr_p05, cat_features=CAT_COLS)
+pool_tr95 = Pool(X_tr, y_tr_p95, cat_features=CAT_COLS)
+pool_tr_mid = Pool(X_tr, y_tr_mid, cat_features=CAT_COLS)
+pool_tr_logw = Pool(X_tr, y_tr_logw, cat_features=CAT_COLS)
+
+print("Training 4 models (Quantile p05/p95 + RMSE mid/logw) ...")
+
+m_q05 = CatBoostRegressor(**COMMON, loss_function="Quantile:alpha=0.05")
+m_q95 = CatBoostRegressor(**COMMON, loss_function="Quantile:alpha=0.95")
+
+m_mid  = CatBoostRegressor(**COMMON, loss_function="RMSE")
+m_logw = CatBoostRegressor(**COMMON, loss_function="RMSE")
+
+m_q05.fit(pool_tr05)
+m_q95.fit(pool_tr95)
+m_mid.fit(pool_tr_mid)
+m_logw.fit(pool_tr_logw)
+
+# history from full train
+last_p05, last_p95, q05, q95 = build_history_from_df(train)
+
+test_sorted = test.sort_values(["dt", "product_id"]).copy()
+
+# storage (by original index)
+# pred_q_lo = np.empty(len(test_sorted), dtype=float)
+# pred_q_hi = np.empty(len(test_sorted), dtype=float)
+
+pred_e_lo = np.empty(len(test_sorted), dtype=float)
+pred_e_hi = np.empty(len(test_sorted), dtype=float)
+
+# ensemble weights
+W_Q = 0.75   # вес quantile
+W_R = 0.25   # вес rmse(mid/logw)
+MIN_WIDEN = 0.0
+
+# width scaling
+K_WIDTH = 1.10
+
+print("AR predicting test by date ...")
+
+for d, idx in test_sorted.groupby("dt").groups.items():
+    batch = test_sorted.loc[idx].copy().sort_values(["product_id"])
+    batch = add_ar_lags(batch, last_p05, last_p95, q05, q95)
+
+    pool_b = Pool(batch[FEATURES], cat_features=CAT_COLS)
+
+    # --- Quantile preds ---
+    q05p = m_q05.predict(pool_b)
+    q95p = m_q95.predict(pool_b)
+    q_lo = np.minimum(q05p, q95p)
+    q_hi = np.maximum(q05p, q95p)
+
+    # --- RMSE mid/logw preds -> interval ---
+    midp = m_mid.predict(pool_b)
+    logwp = m_logw.predict(pool_b)
+    wp = np.exp(np.clip(logwp, -12, 6))  # clip to avoid overflow
+    # width scaling
+    wp = wp * K_WIDTH
+
+    r_lo = midp - wp / 2.0
+    r_hi = midp + wp / 2.0
+    r_lo, r_hi = np.minimum(r_lo, r_hi), np.maximum(r_lo, r_hi)
+
+    # store quantile-only AR output
+    q_hi = np.maximum(q_hi, q_lo + MIN_WIDEN)
+
+    # ensemble via mid/logw blending (стабильнее, чем смешивать p05/p95)
+    q_mid = (q_lo + q_hi) / 2.0
+    q_w   = np.maximum(q_hi - q_lo, EPS_W)
+    q_logw = np.log(q_w)
+
+    r_mid = (r_lo + r_hi) / 2.0
+    r_w   = np.maximum(r_hi - r_lo, EPS_W)
+    r_logw = np.log(r_w)
+
+    ens_mid  = W_Q * q_mid  + W_R * r_mid
+    ens_logw = W_Q * q_logw + W_R * r_logw
+
+    ens_w = np.exp(np.clip(ens_logw, -12, 6))
+    ens_lo = ens_mid - ens_w / 2.0
+    ens_hi = ens_mid + ens_w / 2.0
+    ens_lo, ens_hi = np.minimum(ens_lo, ens_hi), np.maximum(ens_lo, ens_hi)
+    ens_hi = np.maximum(ens_hi, ens_lo + MIN_WIDEN)
+
+    pos = test_sorted.index.get_indexer(batch.index)
+
+    # pred_q_lo[pos] = q_lo
+    # pred_q_hi[pos] = q_hi
+    pred_e_lo[pos] = ens_lo
+    pred_e_hi[pos] = ens_hi
+
+    update_history_with_preds(batch, ens_lo, ens_hi, last_p05, last_p95, q05, q95)
+
+# Save submissions
+# out = test_sorted[["row_id"]].copy()
+# out["price_p05"] = pred_q_lo
+# out["price_p95"] = pred_q_hi
+# out = out.sort_values("row_id")
+# out.to_csv("submission_quantile_ar.csv", index=False)
+# print("Saved submission_quantile_ar.csv")
+
+sub = test_sorted[["row_id"]].copy()
+sub["price_p05"] = pred_e_lo
+sub["price_p95"] = pred_e_hi
+sub = sub.sort_values("row_id")
+sub.to_csv("results/submission.csv", index=False)
+print("Saved submission.csv")
+# score: 0.25

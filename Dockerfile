@@ -1,17 +1,20 @@
-# Базовый образ Python
-FROM python:3.11-slim
+# CUDA runtime + Ubuntu
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Установка рабочей директории внутри контейнера
 WORKDIR /app
 
-# Копирование файла с зависимостями
-COPY requirements.txt .
+# System deps + python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Установка всех необходимых пакетов
+# (опционально) чтобы "python" работал
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование всех файлов проекта в контейнер
 COPY . .
 
-# Команда запуска вашего решения
 CMD ["python", "main.py"]
