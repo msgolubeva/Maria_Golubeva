@@ -90,14 +90,14 @@ python main.py
    ```
 3. Соберите Docker-образ (замените `Petrov-Ivan` на вашу фамилию-имя):
    ```powershell
-   docker build -t petrov-ivan-solution .
+   docker build -t golubeva-maria-solution .
    ```
 
 Это займет несколько минут при первом запуске.
 
 **Важные моменты:**
 - В команде есть точка `.` в конце - не забудьте её!
-- Имя образа (`petrov-ivan-solution`) должно быть маленькими буквами
+- Имя образа (`golubeva-maria-solution`) должно быть маленькими буквами
 - Используйте дефис `-` вместо пробела
 
 ### Шаг 6: Проверка Docker-образа
@@ -105,7 +105,7 @@ python main.py
 Запустите ваш Docker-контейнер:
 
 ```powershell
-docker run --rm petrov-ivan-solution
+docker run --rm --gpus all golubeva-maria-solution
 ```
 
 Вы должны увидеть вывод вашей программы. Если есть ошибки - исправьте их и повторите сборку.
@@ -115,10 +115,10 @@ docker run --rm petrov-ivan-solution
 Когда все работает, сохраните образ в файл для отправки:
 
 ```powershell
-docker save -o petrov-ivan-solution.tar petrov-ivan-solution
+docker save -o petrov-ivan-solution.tar golubeva-maria-solution
 ```
 
-Это создаст файл `petrov-ivan-solution.tar` в текущей папке.
+Это создаст файл `golubeva-maria-solution.tar` в текущей папке.
 
 ### Шаг 8: Отправка решения
 
