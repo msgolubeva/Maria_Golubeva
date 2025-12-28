@@ -177,9 +177,6 @@ last_p05, last_p95, q05, q95 = build_history_from_df(train)
 test_sorted = test.sort_values(["dt", "product_id"]).copy()
 
 # storage (by original index)
-# pred_q_lo = np.empty(len(test_sorted), dtype=float)
-# pred_q_hi = np.empty(len(test_sorted), dtype=float)
-
 pred_e_lo = np.empty(len(test_sorted), dtype=float)
 pred_e_hi = np.empty(len(test_sorted), dtype=float)
 
@@ -239,21 +236,12 @@ for d, idx in test_sorted.groupby("dt").groups.items():
 
     pos = test_sorted.index.get_indexer(batch.index)
 
-    # pred_q_lo[pos] = q_lo
-    # pred_q_hi[pos] = q_hi
     pred_e_lo[pos] = ens_lo
     pred_e_hi[pos] = ens_hi
 
     update_history_with_preds(batch, ens_lo, ens_hi, last_p05, last_p95, q05, q95)
 
 # Save submissions
-# out = test_sorted[["row_id"]].copy()
-# out["price_p05"] = pred_q_lo
-# out["price_p95"] = pred_q_hi
-# out = out.sort_values("row_id")
-# out.to_csv("submission_quantile_ar.csv", index=False)
-# print("Saved submission_quantile_ar.csv")
-
 sub = test_sorted[["row_id"]].copy()
 sub["price_p05"] = pred_e_lo
 sub["price_p95"] = pred_e_hi
